@@ -66,6 +66,8 @@ def run_pipeline(image_path, detector, debug_dir='debug', report=False):
 
     labels, cands, polys = detector.detect_all(image)
     slope = calculate_median_slope(polys)
+    if not polys and detector.last_slope is not None:
+        slope = detector.last_slope   # LCD reader's own tilt estimate
     print(f'[INFO] image size: {image.shape[1]}x{image.shape[0]}  labels found: {list(labels)}  tilt: {slope:.3f}')
     print('[INFO] numbers found:', [(c['value'], round(c['conf'], 2), round(c['agreement'], 2)) for c in cands])
     result = assign_readings(cands, labels, slope, image.shape[0])

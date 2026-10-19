@@ -11,6 +11,7 @@ import os
 import re
 
 import cv2
+import numpy as np
 
 os.environ['PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT'] = '0'
 try:
@@ -38,6 +39,7 @@ NUMBER_TOKEN = re.compile(r'^[0-9OILBSZ|!]{2,3}$')
 class BPDetector:
     def __init__(self):
         self.ocr = None
+        self.last_slope = None   # fallback device tilt from the LCD reader
         if PaddleOCR is None:
             print('[WARN] PaddleOCR not installed: no labels, no cross-check.')
             return
@@ -140,6 +142,9 @@ class BPDetector:
                 continue
             cand = {'value': int(r['text']), 'box': r['box'],
                     'conf': r['conf'], 'agreement': r['agreement']}
+            if 'poly' in r:
+                cand['poly'] = r['poly']
+            cand['glare_frac'] = r.get('glare_frac', 0.0)
             for p in paddle_cands:                      # cross-check with PaddleOCR
                 if self._overlap(cand['box'], p['box']) > 0.5:
                     if p['value'] == cand['value']:
@@ -164,6 +169,17 @@ class BPDetector:
 
         if CFG['use_dedup']:
             cands = self._dedup(cands)
+
+        # Fallback device tilt: median top-edge slope of the LCD rows, for when
+        # PaddleOCR produced no polygons.
+        slopes = []
+        for r in rows:
+            p = r.get('poly')
+            if p and seven_segment._plausible(r):
+                dx = p[1][0] - p[0][0]
+                if abs(dx) > 5:
+                    slopes.append((p[1][1] - p[0][1]) / dx)
+        self.last_slope = float(np.median(slopes)) if slopes else None
 
         # 3) Safety net: if the LCD reader found fewer than 3 numbers, add PaddleOCR's
         if len(cands) < 3:

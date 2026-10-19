@@ -427,7 +427,8 @@ def _rows_from_lcd(gray, M, frac=0.35):
                int(back[:, 0].max()), int(back[:, 1].max())]
         near_edge = y1 < 0.03 * h or y2 > 0.97 * h or x1 < 0.03 * w or x2 > 0.97 * w
         out.append({'text': text, 'conf': conf, 'h': y2 - y1, 'box': box,
-                    'touch': near_edge, 'alternatives': alternatives})
+                    'touch': near_edge, 'alternatives': alternatives,
+                    'poly': back.astype(int).tolist(), 'deskew': _deskew_angle})
     return out
 
 
@@ -479,6 +480,14 @@ def _read_one_orientation(img, label_boxes=None):
     for r in rows:
         r['agreement'] = (1 + sum(_agrees(r, o) for o in others)) / (1 + len(others))
     return rows, best_q
+
+
+def _unrotate_pt(x, y, rot, H, W):
+    if rot == cv2.ROTATE_90_CLOCKWISE:
+        return y, H - 1 - x
+    if rot == cv2.ROTATE_90_COUNTERCLOCKWISE:
+        return W - 1 - y, x
+    return W - 1 - x, H - 1 - y
 
 
 def _unrotate_box(box, rot, H, W):
@@ -566,7 +575,8 @@ def _apply_glare_cap(rows, img):
     for r in rows:
         x1, y1, x2, y2 = (int(v) for v in r['box'])
         sub = gm[max(0, y1):min(gm.shape[0], y2), max(0, x1):min(gm.shape[1], x2)]
-        if sub.size and float(sub.mean()) > 0.03:
+        r['glare_frac'] = float(sub.mean()) if sub.size else 0.0
+        if r['glare_frac'] > 0.03:
             r['agreement'] = min(r['agreement'], 0.5)
             r['glare'] = True
     return rows
@@ -613,5 +623,8 @@ def read_lcd(img, label_boxes=None):
         if r_q > best_q and sum(_plausible(r) for r in r_rows) >= 3:
             for r in r_rows:
                 r['box'] = _unrotate_box(r['box'], rot, H, W)
+                if 'poly' in r:
+                    r['poly'] = [list(_unrotate_pt(px, py, rot, H, W))
+                                 for px, py in r['poly']]
             best_rows, best_q = r_rows, r_q
     return _apply_glare_cap(best_rows, img), best_q > 0
