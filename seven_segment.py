@@ -20,6 +20,8 @@ CFG = {
     'use_tta': True,            # photometric test-time augmentation + voting
     'tta_channels': True,       # TTA: also try the B, G, R channels
     'use_deskew': True,         # in-plane rotation search on the warped LCD
+    'warp_long_side': 800,      # the straightened LCD is resized to about this
+    'whole_image_fallback': True,  # read the whole photo when no screen qualifies
 }
 
 # Lit bars, in order: a=top, b=top-right, c=bottom-right, d=bottom,
@@ -31,7 +33,7 @@ DIGITS = {
     (1, 0, 1, 1, 1, 1, 1): 6, (1, 1, 1, 0, 0, 0, 0): 7, (1, 1, 1, 0, 0, 1, 0): 7,
     (1, 1, 1, 1, 1, 1, 1): 8, (1, 1, 1, 1, 0, 1, 1): 9,
 }
-WARP_LONG_SIDE = 600   # the straightened LCD is resized to about this many pixels
+WARP_LONG_SIDE = 600   # legacy default; CFG['warp_long_side'] is the live value
 MAX_CANDIDATES = 10    # how many possible screens are read and compared
 
 
@@ -124,15 +126,18 @@ def _warp(img, quad):
     tl, tr, br, bl = quad
     w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
     h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2
-    k = WARP_LONG_SIDE / max(w, h)
+    k = CFG['warp_long_side'] / max(w, h)
     w, h = max(20, int(w * k)), max(20, int(h * k))
     dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(quad, dst)
     return cv2.warpPerspective(img, M, (w, h)), M
 
 
-def find_lcd_candidates(img, keep=MAX_CANDIDATES):
-    """Up to `keep` likely screens as [(straightened gray LCD, matrix), ...]."""
+def find_lcd_candidates(img, keep=MAX_CANDIDATES, label_boxes=None):
+    """Up to `keep` likely screens as [(straightened gray LCD, matrix), ...].
+    Contours are searched on several tone curves (raw, CLAHE, gamma-brightened)
+    and with auto-Canny thresholds. `label_boxes` (optional, OCR label rects in
+    original-image pixels) adds a candidate crop around the printed labels."""
     H, W = img.shape[:2]
     s = 1000 / max(H, W)
     small = cv2.resize(img, None, fx=s, fy=s)
@@ -146,25 +151,41 @@ def find_lcd_candidates(img, keep=MAX_CANDIDATES):
             seen.add(key)
             quads.append(q)
 
-    for blur in (5, 9):
-        g = cv2.GaussianBlur(cv2.createCLAHE(2.0, (8, 8)).apply(gray), (blur, blur), 0)
-        for lo, hi in ((40, 120), (20, 60), (60, 160)):
-            e = cv2.dilate(cv2.Canny(g, lo, hi), np.ones((3, 3), np.uint8))
-            cs, _ = cv2.findContours(e, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            for c in cs:
-                if not 0.01 * A < cv2.contourArea(c) < 0.4 * A:
-                    continue
-                hull = cv2.convexHull(c)
-                # (a) steady choice: the tilted rectangle that best fits the outline
-                rect = cv2.minAreaRect(hull)
-                rw, rh = rect[1]
-                if rw > 0 and rh > 0 and cv2.contourArea(hull) / (rw * rh) > 0.8 \
-                        and 0.4 < rw / rh < 2.5:
-                    add(_order_quad(cv2.boxPoints(rect)))
-                # (b) perspective choice: a 4-corner outline
-                ap = cv2.approxPolyDP(c, 0.03 * cv2.arcLength(c, True), True)
-                if len(ap) == 4 and cv2.isContourConvex(ap):
-                    add(_order_quad(ap))
+    lut = np.clip((np.arange(256) / 255.0) ** 0.6 * 255.0, 0, 255).astype(np.uint8)
+    tones = [gray, cv2.createCLAHE(2.0, (8, 8)).apply(gray), cv2.LUT(gray, lut)]
+    for base in tones:
+        for blur in (5, 9):
+            g = cv2.GaussianBlur(base, (blur, blur), 0)
+            med = float(np.median(g))
+            pairs = [(max(5.0, 0.66 * med), max(10.0, 1.33 * med)),
+                     (40, 120), (20, 60), (60, 160)]
+            for lo, hi in pairs:
+                e = cv2.dilate(cv2.Canny(g, lo, hi), np.ones((3, 3), np.uint8))
+                cs, _ = cv2.findContours(e, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+                for c in cs:
+                    if not 0.01 * A < cv2.contourArea(c) < 0.4 * A:
+                        continue
+                    hull = cv2.convexHull(c)
+                    # (a) steady choice: the tilted rectangle that best fits the outline
+                    rect = cv2.minAreaRect(hull)
+                    rw, rh = rect[1]
+                    if rw > 0 and rh > 0 and cv2.contourArea(hull) / (rw * rh) > 0.8 \
+                            and 0.4 < rw / rh < 2.5:
+                        add(_order_quad(cv2.boxPoints(rect)))
+                    # (b) perspective choice: a 4-corner outline
+                    ap = cv2.approxPolyDP(c, 0.03 * cv2.arcLength(c, True), True)
+                    if len(ap) == 4 and cv2.isContourConvex(ap):
+                        add(_order_quad(ap))
+
+    if label_boxes:
+        # The numbers sit next to their printed labels; propose a generous crop
+        # around the label region as one more candidate.
+        x1 = min(b[0] for b in label_boxes); y1 = min(b[1] for b in label_boxes)
+        x2 = max(b[2] for b in label_boxes); y2 = max(b[3] for b in label_boxes)
+        cx, cy = (x1 + x2) / 2 * s, (y1 + y2) / 2 * s
+        hw, hh = (x2 - x1) / 2 * s * 3.0, (y2 - y1) / 2 * s * 1.4
+        add(np.float32([[cx - hw, cy - hh], [cx + hw, cy - hh],
+                        [cx + hw, cy + hh], [cx - hw, cy + hh]]))
 
     scored = []
     for q in quads:
@@ -172,10 +193,14 @@ def find_lcd_candidates(img, keep=MAX_CANDIDATES):
             warped, M = _warp(img, _grow(q / s, pad))
             wg = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             sc = _digit_score(wg)
-            if sc >= 3:
+            if sc >= 1:
                 scored.append((sc, wg, M))
-    scored.sort(key=lambda t: -t[0])
-    return [(g, M) for _, g, M in scored[:keep]]
+    for gate in (3, 2, 1):      # adaptive gate: prefer strict, relax if empty
+        good = [t for t in scored if t[0] >= gate]
+        if good:
+            break
+    good.sort(key=lambda t: -t[0])
+    return [(g, M) for _, g, M in good[:keep]]
 
 
 # ---------------------------------------------------------- digit reading
@@ -361,15 +386,23 @@ def _agrees(row, other_rows):
     return any(abs(_row_center_y(o) - cy) < half and o['text'] == row['text'] for o in other_rows)
 
 
-def _read_one_orientation(img):
+def _read_one_orientation(img, label_boxes=None):
     """Returns (rows, quality) for the most believable screen. Every row gets
     'agreement' = share of other readings (other sensitivity levels and other
     screen candidates) that produced the same text at the same place."""
     scored = []
-    for gray, M in find_lcd_candidates(img):
+    for gray, M in find_lcd_candidates(img, label_boxes=label_boxes):
         rows = _rows_from_lcd(gray, M)
         scored.append((_quality(rows), gray, M, rows))
     scored = [t for t in scored if t[0] > 0]
+    if not scored and CFG['whole_image_fallback']:
+        # No screen qualified: try the whole photo (downscaled) as a last resort.
+        s = min(1.0, CFG['warp_long_side'] / max(img.shape[:2]))
+        wg = cv2.cvtColor(cv2.resize(img, None, fx=s, fy=s), cv2.COLOR_BGR2GRAY)
+        M = np.float64([[s, 0, 0], [0, s, 0], [0, 0, 1]])   # original -> scaled
+        rows = _rows_from_lcd(wg, M)
+        if _quality(rows) > 0:
+            scored = [(_quality(rows), wg, M, rows)]
     if not scored:
         return [], 0.0
     scored.sort(key=lambda t: -t[0])
@@ -473,14 +506,14 @@ def _apply_glare_cap(rows, img):
     return rows
 
 
-def _read_with_tta(img):
+def _read_with_tta(img, label_boxes=None):
     """Read the photo under several tone curves and vote. Returns
     (rows, quality, n_variants_run). Stops early once 2 variants fully agree
     on 3 plausible rows."""
     rows_per_variant = []
     merged, quality = [], 0.0
     for n_run, variant in enumerate(photometric_variants(img), start=1):
-        rows, _q = _read_one_orientation(variant)
+        rows, _q = _read_one_orientation(variant, label_boxes=label_boxes)
         rows_per_variant.append(rows)
         merged = _vote_merge(rows_per_variant, n_run)
         quality = _quality(merged)
@@ -491,13 +524,21 @@ def _read_with_tta(img):
     return merged, quality, len(rows_per_variant)
 
 
-def read_lcd(img):
+def read_lcd(img, label_boxes=None):
     """Returns (rows, found): the digit rows of the most believable screen.
     Tries the photo upright first; if that does not give 3 plausible numbers it also
-    tries sideways / upside-down (some photos are stored rotated)."""
+    tries sideways / upside-down (some photos are stored rotated).
+    `label_boxes` (optional) are OCR label rects in original-image pixels, used
+    to propose one extra LCD candidate around the printed labels."""
     H, W = img.shape[:2]
-    read = _read_with_tta if CFG['use_tta'] else lambda i: (*_read_one_orientation(i), 1)
-    rows, q = read(img)[:2]
+    if CFG['use_tta']:
+        def read(i):
+            r, q, _n = _read_with_tta(i, label_boxes=label_boxes)
+            return r, q
+    else:
+        def read(i):
+            return _read_one_orientation(i, label_boxes=label_boxes)
+    rows, q = read(img)
     if sum(_plausible(r) for r in rows) >= 3:
         return _apply_glare_cap(rows, img), True
     best_rows, best_q = rows, q
