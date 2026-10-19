@@ -48,6 +48,31 @@ wrong-and-not-flagged = 0 (baseline also 0 because everything was flagged).
 600: ~5.5–9 s/img (read_lcd only). 800: ~7–11 s/img, no accuracy gain on this
 sample (one regression: 105→115). Default 800 per spec; ablate on aggregate.
 
+## Stress-set check (augmented variants of the 4 known failures, read_lcd level)
+
+60 variants (14 per image: 6 rotations, 2 gamma, 2 glare, blur, 3 combos).
+Metric: all 3 true values present among plausible rows (full recall).
+
+- Full recall: 0/4 in every augmentation category — these 4 images are the
+  hardest of the set; their variants stay hard. Omron variants usually recover
+  87 and 78 (and 135/136 SYS); NUTEC variants usually recover 105 and 66;
+  Beurer is consistently wrong (81/30); TATA consistently fails.
+- Inpaint A/B on the 8 glare variants: 0/8 vs 0/8 full recall — no measurable
+  effect. Default stays OFF.
+- Found and fixed via this check: artifact slivers (tick marks, icons) grouped
+  into all-ones rows like '111' at conf 1.0 via the narrow-'1' shortcut —
+  a triple like (111, 44, 50) could have passed the geometry hard rules
+  unflagged. Now: narrow-'1' shortcut returns conf 0.6, all-ones rows get
+  conf * 0.5.
+
+## Old-vs-new regression check (12 random clean-ish images, read_lcd only)
+
+- New reader finds strictly more rows (old often found none); e.g. Omron
+  20210809_16_13_29: old found 1 of 3 true values, new finds 2 (100, 67).
+- New also emits junk rows on blank/mid-inflation screens ('111', '44') —
+  these carry low conf/agreement after the all-ones fix and cannot form a
+  valid unflagged triple.
+
 ## Baseline / augmented-set metrics
 
 PENDING truth.csv. Commands to run once it exists:
