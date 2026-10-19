@@ -17,7 +17,7 @@ _SEG = {
 _PATTERNS = {d: pat for pat, d in ss.DIGITS.items() if d != 7 or pat == (1, 1, 1, 0, 0, 0, 0)}
 
 
-def draw_digit(digit, scale=12, thick=5, slant=0.0, ink=30, bg=200):
+def draw_digit(digit, scale=12, thick=11, slant=0.0, ink=30, bg=200):
     """Render a seven-segment digit as a gray image (dark ink on bright bg)."""
     pat = _PATTERNS[digit]
     h, w = 7 * scale, 4 * scale + int(abs(slant) * 7 * scale) + scale
@@ -122,15 +122,26 @@ def test_vote_merge_majority_wins():
 # ------------------------------------------------------------- n-best read
 def test_read_digit_nbest_all_digits():
     for d in range(10):
-        img = draw_digit(d, slant=0.15)
+        img = draw_number(str(d) * 3, slant=0.15)
         m = ss.dark_mask(img)
-        ys, xs = np.nonzero(m)
-        crop = m[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
-        nbest = ss._read_digit_nbest(crop)
-        assert len(nbest) == 3
-        assert nbest[0][0] == d, f'digit {d} read as {nbest[0][0]}'
-        # wrapper agrees with old-style call
-        assert ss._read_digit(crop)[0] == d
+        sh = ss._shear(m, ss._best_shear(m))     # mirror the pipeline: shear the
+        cols = sh.sum(axis=0) > 0.05 * sh.shape[0]   # row, split columns, crop
+        pieces, c0 = [], None
+        for cx in range(len(cols) + 1):
+            on = cx < len(cols) and cols[cx]
+            if on and c0 is None:
+                c0 = cx
+            if not on and c0 is not None:
+                piece, _ = ss._tight(sh[:, c0:cx])
+                if piece.size:
+                    pieces.append(piece)
+                c0 = None
+        assert len(pieces) == 3, f'digit {d}: got {len(pieces)} pieces'
+        for piece in pieces:
+            nbest = ss._read_digit_nbest(piece)
+            assert len(nbest) == 3
+            assert nbest[0][0] == d, f'digit {d} read as {nbest[0][0]}'
+            assert ss._read_digit(piece)[0] == d   # wrapper agrees
 
 
 if __name__ == '__main__':

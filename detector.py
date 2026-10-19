@@ -20,6 +20,11 @@ except ImportError:  # still works, just without labels / cross-check
 
 import seven_segment
 
+CFG = {
+    'use_alternatives': True,  # expose per-row second-best readings as candidates
+    'use_dedup': True,         # merge duplicate candidates (same value, same place)
+}
+
 # Patterns run on LETTERS ONLY, so "P/min" becomes "PMIN".
 LABEL_PATTERNS = {
     'SYS': re.compile(r'^(SYS|SYSTOLIC)'),
@@ -95,6 +100,20 @@ class BPDetector:
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         return [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
 
+    @staticmethod
+    def _dedup(cands):
+        """Merge candidates with the same value at the same place (e.g. the LCD
+        reader and the PaddleOCR safety net both found the 78)."""
+        kept = []
+        for c in sorted(cands, key=lambda c: -(c['conf'] + c['agreement'])):
+            for k in kept:
+                if k['value'] == c['value'] and BPDetector._overlap(k['box'], c['box']) > 0.3:
+                    k['agreement'] = max(k['agreement'], c['agreement'])
+                    break
+            else:
+                kept.append(c)
+        return kept
+
     # ----------------------------------------------------------------- main
     def detect_all(self, image):
         """`image` is a BGR array. Returns (labels, candidates, polygons).
@@ -113,8 +132,9 @@ class BPDetector:
                 paddle_cands.append({'value': value, 'box': box, 'conf': score})
 
         # 2) The real reader: seven-segment digits
-        rows, _ = seven_segment.read_lcd(image)
+        rows, _ = seven_segment.read_lcd(image, label_boxes=list(labels.values()))
         cands = []
+        n_alts = 0
         for r in rows:
             if not seven_segment._plausible(r):
                 continue
@@ -128,6 +148,22 @@ class BPDetector:
                         cand['agreement'] = min(cand['agreement'], 0.3)
                     break
             cands.append(cand)
+            # second-best readings of the same row, penalized and capped, so the
+            # geometry hard rules can pick them when the primary read is wrong
+            if CFG['use_alternatives']:
+                for alt in r.get('alternatives', [])[:2]:
+                    if n_alts >= 4 or not alt.isdigit():
+                        continue
+                    value = int(alt)
+                    if 30 <= value <= 260:
+                        cands.append({'value': value, 'box': r['box'],
+                                      'conf': r['conf'] * 0.7,
+                                      'agreement': r['agreement'] * 0.5,
+                                      'alternative': True})
+                        n_alts += 1
+
+        if CFG['use_dedup']:
+            cands = self._dedup(cands)
 
         # 3) Safety net: if the LCD reader found fewer than 3 numbers, add PaddleOCR's
         if len(cands) < 3:

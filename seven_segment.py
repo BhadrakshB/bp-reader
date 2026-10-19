@@ -48,22 +48,12 @@ def glare_fraction(gray):
     return float((gray >= 245).mean())
 
 
-def dark_mask(gray, frac=0.35):
-    """1 where a pixel is clearly darker than its surroundings (the lit segments).
-
-    Relative (log) contrast against a local background that ignores glare, so
-    dim photos and photos with specular highlights both still yield segments."""
-    if CFG['use_inpaint'] and glare_fraction(gray) > 0:
-        gm = ((gray >= 245).astype(np.uint8) * 255)
-        gray = cv2.inpaint(gray, gm, 5, cv2.INPAINT_TELEA)
-    if CFG['mask_method'] == 'blackhat':
-        return _dark_mask_blackhat(gray, frac)
-
+def contrast_map(gray):
+    """Relative log-darkness vs the local glare-free background (0 on glare).
+    This is what dark_mask thresholds; it is also used directly for gray-level
+    zone scoring of digits."""
     g = cv2.GaussianBlur(gray, (5, 5), 0)
     glare = _glare_mask(gray) if CFG['use_glare_mask'] else np.zeros(gray.shape, bool)
-    # Background brightness = a very wide blur, computed only over non-glare
-    # pixels (normalized convolution). Doing it on a 1/4-size copy gives the
-    # same result about 20x faster.
     sigma = max(8, min(gray.shape) / 8)
     valid = (~glare).astype(np.float32)
     num = cv2.resize(g.astype(np.float32) * valid, None, fx=0.25, fy=0.25,
@@ -76,7 +66,26 @@ def dark_mask(gray, frac=0.35):
     d = np.log(bg + 8.0) - np.log(g.astype(np.float32) + 8.0)
     np.clip(d, 0.0, None, out=d)
     d[glare] = 0.0
-    ref = d[~glare] if glare.any() else d.ravel()
+    return d
+
+
+def dark_mask(gray, frac=0.35):
+    """1 where a pixel is clearly darker than its surroundings (the lit segments).
+
+    Relative (log) contrast against a local background that ignores glare, so
+    dim photos and photos with specular highlights both still yield segments."""
+    if CFG['use_inpaint'] and glare_fraction(gray) > 0:
+        gm = ((gray >= 245).astype(np.uint8) * 255)
+        gray = cv2.inpaint(gray, gm, 5, cv2.INPAINT_TELEA)
+    if CFG['mask_method'] == 'blackhat':
+        return _dark_mask_blackhat(gray, frac)
+
+    d = contrast_map(gray)
+    if CFG['use_glare_mask']:
+        glare = _glare_mask(gray)
+        ref = d[~glare] if glare.any() else d.ravel()
+    else:
+        ref = d.ravel()
     thr = max(0.03, frac * float(np.percentile(ref, 99.5)))
     m = (d > thr).astype(np.uint8) * 255
     return (cv2.medianBlur(m, 5) > 0).astype(np.uint8)
@@ -204,10 +213,10 @@ def find_lcd_candidates(img, keep=MAX_CANDIDATES, label_boxes=None):
 
 
 # ---------------------------------------------------------- digit reading
-def _shear(mask, k):
+def _shear(mask, k, flags=cv2.INTER_NEAREST):
     h, w = mask.shape
     M = np.float32([[1, -k, k * h / 2.0], [0, 1, 0]])
-    return cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
+    return cv2.warpAffine(mask, M, (w, h), flags=flags)
 
 
 def _best_shear(mask):
@@ -221,24 +230,62 @@ def _best_shear(mask):
     return bk
 
 
-def _read_digit(m):
-    """m = tight 0/1 crop of ONE digit, slant removed. Returns (digit, confidence)."""
+def _zone_fills(m, d=None):
+    """How strongly each of the 7 bars is lit, as a 7-vector in a,b,c,d,e,f,g
+    order. With a contrast map `d`, zones are scored by mean contrast and
+    normalized by this digit's OWN strongest zone, which keeps ghost segments
+    (faint unlit bars) below the truly lit ones."""
     h, w = m.shape
-    if w < 0.42 * h:
-        return 1, 1.0
     zones = {
-        'a': (.15, .85, 0, .17), 'g': (.15, .85, .41, .59), 'd': (.15, .85, .83, 1),
-        'f': (0, .3, .08, .46), 'b': (.7, 1, .08, .46),
-        'e': (0, .3, .54, .92), 'c': (.7, 1, .54, .92),
+        'a': (.25, .75, 0, .17), 'g': (.3, .7, .41, .59), 'd': (.25, .75, .83, 1),
+        'f': (0, .25, .1, .44), 'b': (.75, 1, .1, .44),
+        'e': (0, .25, .56, .9), 'c': (.75, 1, .56, .9),
     }
+    src = d if d is not None else m
     r = []
     for name in 'abcdefg':
         x1, x2, y1, y2 = zones[name]
-        z = m[int(y1 * h):max(int(y2 * h), int(y1 * h) + 1),
-              int(x1 * w):max(int(x2 * w), int(x1 * w) + 1)]
-        r.append(min(1.0, float(z.mean()) / 0.7))
-    dists = sorted((sum(abs(a - b) for a, b in zip(r, pat)), d) for pat, d in DIGITS.items())
-    return dists[0][1], max(0.0, min(1.0, dists[1][0] - dists[0][0]))
+        z = src[int(y1 * h):max(int(y2 * h), int(y1 * h) + 1),
+                int(x1 * w):max(int(x2 * w), int(x1 * w) + 1)]
+        r.append(float(z.mean()))
+    if d is None:
+        return [min(1.0, v / 0.7) for v in r]
+    mx = max(r)
+    return [v / mx for v in r] if mx > 1e-6 else [0.0] * 7
+
+
+def _tight(piece, piece_d=None, margin=0.1):
+    """Tight crop around the ink, with a small margin so that the bars at the
+    edge (a, d) are not cut in half. Returns (mask_crop, contrast_crop)."""
+    ys, xs = np.nonzero(piece)
+    mh = int(margin * (ys.max() - ys.min() + 1)) + 1
+    y1, y2 = max(0, ys.min() - mh), min(piece.shape[0], ys.max() + 1 + mh)
+    x1, x2 = max(0, xs.min() - mh), min(piece.shape[1], xs.max() + 1 + mh)
+    return piece[y1:y2, x1:x2], (piece_d[y1:y2, x1:x2] if piece_d is not None else None)
+
+
+def _read_digit_nbest(m, d=None):
+    """m = tight 0/1 crop of ONE digit, slant removed; d = optional contrast map
+    of the same crop. Returns the 3 best [(digit, distance), ...], ascending."""
+    h, w = m.shape
+    if w < 0.28 * h:    # a sliver this narrow can only be a "1"; zone sampling
+        return [(1, 0.0), (7, 1.0), (4, 1.0)]   # is unreliable at this width
+    r = _zone_fills(m, d)
+    dists = sorted((sum(abs(a - b) for a, b in zip(r, pat)), dg)
+                   for pat, dg in DIGITS.items())
+    best = {}
+    for dist, dg in dists:          # dists ascending: first hit is the smallest
+        if dg not in best:
+            best[dg] = dist
+    return sorted(((dg, dist) for dg, dist in best.items()), key=lambda t: t[1])[:3]
+
+
+def _read_digit(m, d=None):
+    """m = tight 0/1 crop of ONE digit, slant removed. Returns (digit, confidence)."""
+    nb = _read_digit_nbest(m, d)
+    if nb[0][1] == 0.0 and nb[0][0] == 1:
+        return 1, 1.0
+    return nb[0][0], max(0.0, min(1.0, nb[1][1] - nb[0][1]))
 
 
 def _deskew(gray, M):
@@ -277,6 +324,7 @@ def _rows_from_lcd(gray, M, frac=0.35):
     gray, M, _deskew_angle = _deskew(gray, M)
     h, w = gray.shape
     m = dark_mask(gray, frac)
+    dmap = contrast_map(gray)
     ins = max(3, int(0.02 * min(w, h)))
     m[:ins] = 0; m[-ins:] = 0; m[:, :ins] = 0; m[:, -ins:] = 0
 
@@ -297,7 +345,7 @@ def _rows_from_lcd(gray, M, frac=0.35):
     glyphs = []
     for i in range(1, n):
         gx, gy, gw, gh, _a = st[i]
-        if gh < 0.07 * h or gw > 1.1 * gh or gw < 0.16 * gh:
+        if gh < 0.07 * h or gw > 1.1 * gh or gw < 0.10 * gh:
             continue
         glyphs.append({'x': gx, 'y': gy, 'w': gw, 'h': gh, 'id': i})
 
@@ -338,10 +386,12 @@ def _rows_from_lcd(gray, M, frac=0.35):
         sub = np.zeros_like(m[ry1:ry2, rx1:rx2])
         for g in gl:
             sub |= ((lab == g['id'])[ry1:ry2, rx1:rx2] & (m[ry1:ry2, rx1:rx2] > 0)).astype(np.uint8)
-        sh = _shear(sub, _best_shear(sub))
+        k = _best_shear(sub)
+        sh = _shear(sub, k)
+        shd = _shear(dmap[ry1:ry2, rx1:rx2] * sub, k, flags=cv2.INTER_LINEAR)
 
-        cols = sh.sum(axis=0) > 0
-        digits, c0 = [], None
+        cols = sh.sum(axis=0) > 0.03 * sh.shape[0]   # one noise pixel cannot
+        digits, nbests, c0 = [], [], None            # bridge two digits
         for cx in range(len(cols) + 1):
             on = cx < len(cols) and cols[cx]
             if on and c0 is None:
@@ -350,18 +400,34 @@ def _rows_from_lcd(gray, M, frac=0.35):
                 piece = sh[:, c0:cx]
                 ys, xs = np.nonzero(piece)
                 if len(ys) and (ys.max() - ys.min()) > 0.5 * (y2 - y1):
-                    digits.append(_read_digit(piece[ys.min():ys.max() + 1, xs.min():xs.max() + 1]))
+                    pm, pd = _tight(piece, shd[:, c0:cx])
+                    nb = _read_digit_nbest(pm, pd)
+                    nbests.append(nb)
+                    digits.append(_read_digit(pm, pd))
                 c0 = None
         if not digits:
             continue
         text = ''.join(str(d) for d, _ in digits)
         conf = float(np.mean([c for _, c in digits]))
+        # alternative readings: flip the least confident digits to their
+        # second-best pattern (geometry hard rules pick between them later)
+        alternatives = []
+        if len(digits) > 1:
+            order = sorted(range(len(digits)), key=lambda i: digits[i][1])
+            for i in order[:2]:
+                if digits[i][1] < 0.6 and len(nbests[i]) > 1:
+                    alt = list(text)
+                    alt[i] = str(nbests[i][1][0])
+                    alt = ''.join(alt)
+                    if alt != text and alt not in alternatives:
+                        alternatives.append(alt)
         corners = np.float32([[[x1, y1]], [[x2, y1]], [[x2, y2]], [[x1, y2]]])
         back = cv2.perspectiveTransform(corners, Minv).reshape(4, 2)
         box = [int(back[:, 0].min()), int(back[:, 1].min()),
                int(back[:, 0].max()), int(back[:, 1].max())]
         near_edge = y1 < 0.03 * h or y2 > 0.97 * h or x1 < 0.03 * w or x2 > 0.97 * w
-        out.append({'text': text, 'conf': conf, 'h': y2 - y1, 'box': box, 'touch': near_edge})
+        out.append({'text': text, 'conf': conf, 'h': y2 - y1, 'box': box,
+                    'touch': near_edge, 'alternatives': alternatives})
     return out
 
 
