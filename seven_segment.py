@@ -11,6 +11,16 @@ reported as a low 'agreement' so the caller can ask for a manual check.
 import cv2
 import numpy as np
 
+# Feature toggles for ablation. Every robustness change can be switched off here.
+CFG = {
+    'use_glare_mask': True,     # exclude saturated pixels from background estimate
+    'use_inpaint': False,       # inpaint glare before masking (A/B: can hurt when
+                                # glare covers a whole digit)
+    'mask_method': 'contrast',  # 'contrast' = log relative contrast, 'blackhat'
+    'use_tta': True,            # photometric test-time augmentation + voting
+    'use_deskew': True,         # in-plane rotation search on the warped LCD
+}
+
 # Lit bars, in order: a=top, b=top-right, c=bottom-right, d=bottom,
 # e=bottom-left, f=top-left, g=middle.  (1,1,1,0,0,1,0) is the 4-stroke "7"
 # some monitors draw.
@@ -25,18 +35,63 @@ MAX_CANDIDATES = 10    # how many possible screens are read and compared
 
 
 # ----------------------------------------------------------------- masking
+def _glare_mask(gray):
+    """1 where the pixel is a saturated specular highlight (dilated a little)."""
+    g = (gray >= 245).astype(np.uint8) * 255
+    return cv2.dilate(g, np.ones((7, 7), np.uint8)) > 0
+
+
+def glare_fraction(gray):
+    return float((gray >= 245).mean())
+
+
 def dark_mask(gray, frac=0.35):
-    """1 where a pixel is clearly darker than its surroundings (the lit segments)."""
+    """1 where a pixel is clearly darker than its surroundings (the lit segments).
+
+    Relative (log) contrast against a local background that ignores glare, so
+    dim photos and photos with specular highlights both still yield segments."""
+    if CFG['use_inpaint'] and glare_fraction(gray) > 0:
+        gm = ((gray >= 245).astype(np.uint8) * 255)
+        gray = cv2.inpaint(gray, gm, 5, cv2.INPAINT_TELEA)
+    if CFG['mask_method'] == 'blackhat':
+        return _dark_mask_blackhat(gray, frac)
+
     g = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Background brightness = a very wide blur. Doing it on a 1/4-size copy gives
-    # the same result about 20x faster.
+    glare = _glare_mask(gray) if CFG['use_glare_mask'] else np.zeros(gray.shape, bool)
+    # Background brightness = a very wide blur, computed only over non-glare
+    # pixels (normalized convolution). Doing it on a 1/4-size copy gives the
+    # same result about 20x faster.
     sigma = max(8, min(gray.shape) / 8)
-    small = cv2.resize(g, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
-    small = cv2.GaussianBlur(small, (0, 0), sigma / 4)
-    bg = cv2.resize(small, (g.shape[1], g.shape[0]), interpolation=cv2.INTER_LINEAR)
-    d = bg.astype(np.int16) - g.astype(np.int16)
-    thr = max(10, frac * np.percentile(d, 99.5))
+    valid = (~glare).astype(np.float32)
+    num = cv2.resize(g.astype(np.float32) * valid, None, fx=0.25, fy=0.25,
+                     interpolation=cv2.INTER_AREA)
+    den = cv2.resize(valid, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    num = cv2.GaussianBlur(num, (0, 0), sigma / 4)
+    den = cv2.GaussianBlur(den, (0, 0), sigma / 4)
+    bg = cv2.resize(num / np.maximum(den, 1e-3), (g.shape[1], g.shape[0]),
+                    interpolation=cv2.INTER_LINEAR)
+    d = np.log(bg + 8.0) - np.log(g.astype(np.float32) + 8.0)
+    np.clip(d, 0.0, None, out=d)
+    d[glare] = 0.0
+    ref = d[~glare] if glare.any() else d.ravel()
+    thr = max(0.03, frac * float(np.percentile(ref, 99.5)))
     m = (d > thr).astype(np.uint8) * 255
+    return (cv2.medianBlur(m, 5) > 0).astype(np.uint8)
+
+
+def _dark_mask_blackhat(gray, frac=0.35):
+    """Alternative segment mask: black-hat transform with an elliptical kernel
+    sized relative to the crop. Kept as a fallback variant for voting."""
+    h, w = gray.shape
+    k = max(3, int(0.08 * h)) | 1
+    bh = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    glare = _glare_mask(gray) if CFG['use_glare_mask'] else np.zeros(gray.shape, bool)
+    bh = bh.astype(np.float32)
+    bh[glare] = 0.0
+    ref = bh[~glare] if glare.any() else bh.ravel()
+    thr = max(8.0, frac * float(np.percentile(ref, 99.5)))
+    m = (bh > thr).astype(np.uint8) * 255
     return (cv2.medianBlur(m, 5) > 0).astype(np.uint8)
 
 
@@ -221,7 +276,7 @@ def _rows_from_lcd(gray, M, frac=0.35):
 
         y1 = min(g['y'] for g in gl); y2 = max(g['y'] + g['h'] for g in gl)
         x1 = min(g['x'] for g in gl); x2 = max(g['x'] + g['w'] for g in gl)
-        pad = 6
+        pad = max(4, int(0.06 * (y2 - y1)))
         ry1, ry2, rx1, rx2 = max(0, y1 - pad), y2 + pad, max(0, x1 - 3 * pad), x2 + 3 * pad
         sub = np.zeros_like(m[ry1:ry2, rx1:rx2])
         for g in gl:
