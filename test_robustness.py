@@ -88,15 +88,17 @@ def test_deskew_recovers_known_angle():
                                 borderMode=cv2.BORDER_REPLICATE)
         fixed, M1, found_angle = ss._deskew(tilted, M0)
         assert abs(found_angle + angle) < 1.5, f'{angle} -> {found_angle}'
-        # box of a digit in the deskewed image must map back onto the digit
+        # centroid of the deskewed mask must map back onto the ink in the
+        # original image (compare centroids; the centroid itself can sit in a
+        # gap between segments)
         m = ss.dark_mask(fixed)
         ys, xs = np.nonzero(m)
-        cx, cy = float(xs.mean()), float(ys.mean())
-        back = cv2.perspectiveTransform(np.float32([[[cx, cy]]]),
-                                        np.linalg.inv(M1))[0, 0]
-        bx, by = int(back[0]), int(back[1])
-        assert tilted[max(0, by - 3):by + 4, max(0, bx - 3):bx + 4].mean() < 150, \
-            'mapped point does not land on ink in the original image'
+        back = cv2.perspectiveTransform(
+            np.float32([[[xs.mean(), ys.mean()]]]), np.linalg.inv(M1))[0, 0]
+        mt = ss.dark_mask(tilted)
+        yt, xt = np.nonzero(mt)
+        dist = np.hypot(back[0] - xt.mean(), back[1] - yt.mean())
+        assert dist < 3.0, f'mapped centroid {dist:.1f}px off the ink'
 
 
 # ----------------------------------------------------------- vote merging

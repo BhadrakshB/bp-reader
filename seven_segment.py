@@ -216,9 +216,40 @@ def _read_digit(m):
     return dists[0][1], max(0.0, min(1.0, dists[1][0] - dists[0][0]))
 
 
+def _deskew(gray, M):
+    """Remove small in-plane rotation of the warped LCD.
+    Searches the angle that makes the digit rows most horizontal (sharpest row
+    separation), rotates the image, and folds the rotation into M so that
+    inv(M_new) still maps boxes back to original-image coordinates.
+    Returns (rotated gray, M_new, angle_applied)."""
+    if not CFG['use_deskew']:
+        return gray, M, 0.0
+    m = dark_mask(gray)
+    s = min(1.0, 300.0 / max(m.shape))     # search on a small copy for speed
+    ms = cv2.resize(m, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else m
+    h, w = ms.shape
+
+    def score(ang):
+        R = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), ang, 1.0)
+        rs = cv2.warpAffine(ms, R, (w, h), flags=cv2.INTER_NEAREST).sum(axis=1)
+        return float((rs.astype(np.float64) ** 2).sum())
+
+    angs = np.arange(-12.0, 12.01, 1.0)
+    best = float(angs[int(np.argmax([score(a) for a in angs]))])
+    fine = np.arange(best - 1.0, best + 1.01, 0.25)
+    best = float(fine[int(np.argmax([score(a) for a in fine]))])
+    if abs(best) < 0.25:
+        return gray, M, 0.0
+    h0, w0 = gray.shape
+    R = cv2.getRotationMatrix2D((w0 / 2.0, h0 / 2.0), best, 1.0)
+    fixed = cv2.warpAffine(gray, R, (w0, h0), borderMode=cv2.BORDER_REPLICATE)
+    return fixed, np.vstack([R, [0.0, 0.0, 1.0]]) @ M, best
+
+
 def _rows_from_lcd(gray, M, frac=0.35):
     """Read all digit rows on one straightened LCD picture.
     Each row: {'text','conf','h','box','touch'}, top to bottom, box in full-image pixels."""
+    gray, M, _deskew_angle = _deskew(gray, M)
     h, w = gray.shape
     m = dark_mask(gray, frac)
     ins = max(3, int(0.02 * min(w, h)))
