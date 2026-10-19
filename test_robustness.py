@@ -114,7 +114,7 @@ def test_vote_merge_majority_wins():
     assert by_text == ['105', '66']
     r105 = next(r for r in merged if r['text'] == '105')
     assert abs(r105['agreement'] - 2 / 3) < 1e-6
-    assert r105['conf'] == 0.85  # mean of the agreeing members
+    assert abs(r105['conf'] - 0.85) < 1e-6  # mean of the agreeing members
 
 
 # ------------------------------------------------------------- n-best read

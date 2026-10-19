@@ -18,6 +18,7 @@ CFG = {
                                 # glare covers a whole digit)
     'mask_method': 'contrast',  # 'contrast' = log relative contrast, 'blackhat'
     'use_tta': True,            # photometric test-time augmentation + voting
+    'tta_channels': True,       # TTA: also try the B, G, R channels
     'use_deskew': True,         # in-plane rotation search on the warped LCD
 }
 
@@ -365,19 +366,114 @@ def _unrotate_box(box, rot, H, W):
     return [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
 
 
+# ------------------------------------------------- photometric TTA + voting
+def photometric_variants(img):
+    """Copies of the photo with different tone curves, so that a digit that is
+    invisible under one enhancement often shows up under another."""
+    yield img
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(3.0, (8, 8)).apply(l)
+    yield cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    lut = np.clip((np.arange(256) / 255.0) ** 0.6 * 255.0, 0, 255).astype(np.uint8)
+    yield cv2.LUT(img, lut)
+    if CFG['tta_channels']:
+        for ch in cv2.split(img):
+            yield cv2.cvtColor(ch, cv2.COLOR_GRAY2BGR)
+
+
+def _x_overlap(a, b):
+    return min(a[2], b[2]) - max(a[0], b[0]) > 0
+
+
+def _vote_merge(rows_per_variant, n_variants):
+    """Merge the rows read from all photometric variants.
+    Rows at the same place vote; the majority text wins and 'agreement' is the
+    share of variants that read that text there."""
+    clusters = []  # {'cy', 'h', 'members': [(variant_idx, row), ...]}
+    for vi, rows in enumerate(rows_per_variant):
+        for r in rows:
+            cy, hh = _row_center_y(r), 0.5 * (r['box'][3] - r['box'][1])
+            for cl in clusters:
+                if abs(cl['cy'] - cy) < max(hh, 0.5 * cl['h']) \
+                        and _x_overlap(cl['box'], r['box']):
+                    cl['members'].append((vi, r))
+                    cl['cy'] = float(np.mean([_row_center_y(m[1]) for m in cl['members']]))
+                    cl['h'] = max(cl['h'], r['box'][3] - r['box'][1])
+                    cl['box'] = [min(cl['box'][0], r['box'][0]), min(cl['box'][1], r['box'][1]),
+                                 max(cl['box'][2], r['box'][2]), max(cl['box'][3], r['box'][3])]
+                    break
+            else:
+                clusters.append({'cy': cy, 'h': r['box'][3] - r['box'][1],
+                                 'box': list(r['box']), 'members': [(vi, r)]})
+
+    out = []
+    for cl in clusters:
+        plausible = [(vi, r) for vi, r in cl['members'] if _plausible(r)]
+        if not plausible:
+            continue
+        counts = {}
+        for vi, r in plausible:                      # one vote per variant
+            counts.setdefault(r['text'], set()).add(vi)
+        text, voters = max(counts.items(), key=lambda kv: len(kv[1]))
+        members = [r for vi, r in plausible if r['text'] == text]
+        best = max(members, key=lambda r: r['conf'] * r['h'])
+        row = dict(best)
+        row['text'] = text
+        row['conf'] = float(np.mean([r['conf'] for r in members]))
+        row['agreement_local'] = best.get('agreement', 0.0)
+        row['agreement'] = len(voters) / n_variants
+        out.append(row)
+    out.sort(key=_row_center_y)
+    return out
+
+
+def _apply_glare_cap(rows, img):
+    """Variants often share the same glare-induced error, so a row sitting on a
+    specular highlight may not claim high agreement."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gm = _glare_mask(gray)
+    for r in rows:
+        x1, y1, x2, y2 = (int(v) for v in r['box'])
+        sub = gm[max(0, y1):min(gm.shape[0], y2), max(0, x1):min(gm.shape[1], x2)]
+        if sub.size and float(sub.mean()) > 0.03:
+            r['agreement'] = min(r['agreement'], 0.5)
+            r['glare'] = True
+    return rows
+
+
+def _read_with_tta(img):
+    """Read the photo under several tone curves and vote. Returns
+    (rows, quality, n_variants_run). Stops early once 2 variants fully agree
+    on 3 plausible rows."""
+    rows_per_variant = []
+    merged, quality = [], 0.0
+    for n_run, variant in enumerate(photometric_variants(img), start=1):
+        rows, _q = _read_one_orientation(variant)
+        rows_per_variant.append(rows)
+        merged = _vote_merge(rows_per_variant, n_run)
+        quality = _quality(merged)
+        if n_run >= 2:
+            solid = [r for r in merged if _plausible(r) and r['agreement'] >= 0.999]
+            if len(solid) >= 3:
+                break
+    return merged, quality, len(rows_per_variant)
+
+
 def read_lcd(img):
     """Returns (rows, found): the digit rows of the most believable screen.
     Tries the photo upright first; if that does not give 3 plausible numbers it also
     tries sideways / upside-down (some photos are stored rotated)."""
     H, W = img.shape[:2]
-    rows, q = _read_one_orientation(img)
+    read = _read_with_tta if CFG['use_tta'] else lambda i: (*_read_one_orientation(i), 1)
+    rows, q = read(img)[:2]
     if sum(_plausible(r) for r in rows) >= 3:
-        return rows, True
+        return _apply_glare_cap(rows, img), True
     best_rows, best_q = rows, q
     for rot in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180):
-        r_rows, r_q = _read_one_orientation(cv2.rotate(img, rot))
+        r_rows, r_q = read(cv2.rotate(img, rot))[:2]
         if r_q > best_q and sum(_plausible(r) for r in r_rows) >= 3:
             for r in r_rows:
                 r['box'] = _unrotate_box(r['box'], rot, H, W)
             best_rows, best_q = r_rows, r_q
-    return best_rows, best_q > 0
+    return _apply_glare_cap(best_rows, img), best_q > 0
