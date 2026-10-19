@@ -288,7 +288,7 @@ def _read_digit(m, d=None):
     """m = tight 0/1 crop of ONE digit, slant removed. Returns (digit, confidence)."""
     nb = _read_digit_nbest(m, d)
     if nb[0][1] == 0.0 and nb[0][0] == 1:
-        return 1, 1.0
+        return 1, 0.6    # narrow-sliver shortcut: a structural guess, not a read
     return nb[0][0], max(0.0, min(1.0, nb[1][1] - nb[0][1]))
 
 
@@ -413,6 +413,10 @@ def _rows_from_lcd(gray, M, frac=0.35):
             continue
         text = ''.join(str(d) for d, _ in digits)
         conf = float(np.mean([c for _, c in digits]))
+        if len(text) >= 2 and set(text) == {'1'}:
+            # bar-graph ticks and bezel marks group into all-ones rows; a real
+            # reading is never 11/111 mmHg, so don't let such rows look certain
+            conf *= 0.5
         # alternative readings: flip the least confident digits to their
         # second-best pattern (geometry hard rules pick between them later)
         alternatives = []
