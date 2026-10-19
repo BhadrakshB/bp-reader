@@ -1,127 +1,106 @@
+# main.py
+"""Usage (needs seven_segment.py, detector.py, geometry.py next to it):
+    python main.py images/photo.jpg                       # one photo
+    python main.py --folder images --truth truth.csv      # measure accuracy
+
+truth.csv looks like:
+    filename,sys,dia,pul
+    photo1.jpg,118,76,72
+"""
+
+import argparse
+import csv
+import os
+
 import cv2
-from detector import FreeBPDetector
-from geometry import (
-    calculate_median_slope,
-    fallback_expanding_box_matcher,
-    match_labels_to_numbers,
-)
+
+from detector import BPDetector
+from geometry import assign_readings, calculate_median_slope
 
 
-def is_mapping_valid(mapped):
-    """Checks that all 3 metrics are present and physiologically valid (SYS > DIA)."""
-    if len(mapped) < 3:
-        return False
-    sys_val = mapped['SYS']['value']
-    dia_val = mapped['DIA']['value']
-    pul_val = mapped['PUL']['value']
-    return (
-        (sys_val > dia_val)
-        and (80 <= sys_val <= 250)
-        and (35 <= dia_val <= 150)
-        and (35 <= pul_val <= 200)
-    )
-
-
-def run_pipeline(image_path, debug_output=True):
+def run_pipeline(image_path, detector, debug_dir='debug'):
     image = cv2.imread(image_path)
     if image is None:
-        raise FileNotFoundError(
-            f'Could not load image at {image_path}. Check the file path!'
-        )
+        raise FileNotFoundError(f'Could not load image at {image_path}')
 
-    detector = FreeBPDetector()
+    labels, cands, polys = detector.detect_all(image)
+    slope = calculate_median_slope(polys)
+    print(f'[INFO] image size: {image.shape[1]}x{image.shape[0]}  labels found: {list(labels)}  tilt: {slope:.3f}')
+    print('[INFO] numbers found:', [(c['value'], round(c['conf'], 2), round(c['agreement'], 2)) for c in cands])
+    result = assign_readings(cands, labels, slope, image.shape[0])
+    result['labels_found'] = list(labels.keys())
 
-    # Step 1: Detect labels, numbers, and raw OCR boxes
-    labels, grouped_numbers, raw_ocr_boxes = detector.detect_all(image_path)
-    slope = calculate_median_slope(raw_ocr_boxes)
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        for c in cands:
+            x1, y1, x2, y2 = c['box']
+            cv2.rectangle(image, (x1, y1), (x2, y2), (180, 180, 180), 1)
+        for f, box in labels.items():
+            cv2.rectangle(image, tuple(box[:2]), tuple(box[2:]), (255, 100, 0), 2)
+        for f, c in result['readings'].items():
+            x1, y1, x2, y2 = c['box']
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            cv2.putText(image, f"{f}: {c['value']}", (x1, max(y1 - 10, 25)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+        out = os.path.join(debug_dir, os.path.basename(image_path))
+        cv2.imwrite(out, image)
+    return result
 
-    print(f'[INFO] Detected Labels: {list(labels.keys())}')
-    print(
-        f'[INFO] Estimated Device Tilt Slope (m): {slope:.4f}'
-        f' (~{slope * 57.29:.1f} degrees)'
-    )
-    print(f'[INFO] Numbers Found: {[n["value"] for n in grouped_numbers]}')
 
-    # Step 2: Primary Method -> Match labels to numbers using y = mx + c line projection
-    mapped_metrics = match_labels_to_numbers(labels, grouped_numbers, slope=slope)
-    expanded_debug_box = None
+def summarize(result):
+    vals = {f: c['value'] for f, c in result['readings'].items()}
+    flag = 'CHECK MANUALLY' if result['needs_review'] else 'OK'
+    return vals, flag
 
-    # Step 3: Fallback Method -> Expanding Bounding Box around Labels
-    if not is_mapping_valid(mapped_metrics):
-        print(
-            '[WARN] Primary ray-projection incomplete. Triggering Expanding'
-            ' Bounding Box Fallback...'
-        )
-        fallback_metrics, expanded_debug_box = fallback_expanding_box_matcher(
-            labels, grouped_numbers, image.shape
-        )
-        if fallback_metrics:
-            for field, data in fallback_metrics.items():
-                if field not in mapped_metrics or not is_mapping_valid(
-                    mapped_metrics
-                ):
-                    mapped_metrics[field] = data
 
-    # Step 4: Draw visual debugging overlay
-    if debug_output:
-        h, w, _ = image.shape
+def evaluate(folder, truth_csv, detector):
+    truth = {}
+    with open(truth_csv, newline='') as f:
+        for row in csv.DictReader(f):
+            truth[row['filename']] = (int(row['sys']), int(row['dia']), int(row['pul']))
 
-        # Draw all candidate numbers in thin Grey boxes
-        for num in grouped_numbers:
-            bx1, by1, bx2, by2 = num['box']
-            cv2.rectangle(image, (bx1, by1), (bx2, by2), (180, 180, 180), 1)
+    total = correct = flagged = accepted = accepted_correct = 0
+    for name, expected in truth.items():
+        res = run_pipeline(os.path.join(folder, name), detector)
+        vals, flag = summarize(res)
+        got = (vals.get('SYS'), vals.get('DIA'), vals.get('PUL'))
+        total += 1
+        ok = got == expected
+        correct += ok
+        if res['needs_review']:
+            flagged += 1
+        else:
+            accepted += 1
+            accepted_correct += ok
+        print(f'{name}: got {got} expected {expected} -> '
+              f"{'match' if ok else 'WRONG'} [{flag}]")
 
-        # If the Expanding Box Fallback ran, draw the final Expanded Box in Purple
-        if expanded_debug_box:
-            ex1, ey1, ex2, ey2 = expanded_debug_box
-            cv2.rectangle(image, (ex1, ey1), (ex2, ey2), (255, 0, 255), 2)
-            cv2.putText(
-                image,
-                'Expanded Search Box',
-                (ex1, max(ey1 - 8, 15)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 0, 255),
-                2,
-            )
-
-        # Draw matched labels, full-width rays, and final numbers
-        for field, data in mapped_metrics.items():
-            nx1, ny1, nx2, ny2 = data['num_box']
-            cv2.rectangle(image, (nx1, ny1), (nx2, ny2), (0, 255, 0), 2)
-            cv2.putText(
-                image,
-                f"{field}: {data['value']}",
-                (nx1, max(ny1 - 10, 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-            )
-
-            if data['label_box']:
-                lx1, ly1, lx2, ly2 = data['label_box']
-                cv2.rectangle(image, (lx1, ly1), (lx2, ly2), (255, 100, 0), 2)
-
-            if data['line_params']:
-                A, B, C = data['line_params']
-                x_start, x_end = 10, w - 10
-                y_start = int(A * x_start + C)
-                y_end = int(A * x_end + C)
-                cv2.line(
-                    image, (x_start, y_start), (x_end, y_end), (0, 255, 255), 2
-                )
-
-        cv2.imwrite('debug_result.jpg', image)
-        print('[INFO] Saved visual debug overlay to debug_result.jpg')
-
-    final_output = {
-        field: data['value'] for field, data in mapped_metrics.items()
-    }
-    return final_output
+    print('\n=== RESULTS ===')
+    print(f'All 3 values exactly right: {correct}/{total} ({100 * correct / max(1, total):.0f}%)')
+    print(f'Flagged for manual check:   {flagged}/{total}')
+    if accepted:
+        print(f'Correct among auto-accepted: {accepted_correct}/{accepted} '
+              f'({100 * accepted_correct / accepted:.0f}%)')
+        print(f'Wrong AND not flagged (dangerous): {accepted - accepted_correct}')
 
 
 if __name__ == '__main__':
-    readings = run_pipeline('images/20210818_20_59_05_468_000_ncpLhobRvRMSJp0cq6hCAghjbff1_F_3264_2448.jpg')
-    print('\n--- FINAL BP READINGS ---')
-    print(readings)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('image', nargs='?')
+    ap.add_argument('--folder')
+    ap.add_argument('--truth')
+    args = ap.parse_args()
+
+    det = BPDetector()  # load the OCR model once
+    if args.folder and args.truth:
+        evaluate(args.folder, args.truth, det)
+    elif args.image:
+        res = run_pipeline(args.image, det)
+        vals, flag = summarize(res)
+        print('\n--- FINAL BP READINGS ---')
+        print(vals, f'[{flag}]')
+        for r in res['reasons']:
+            print(' -', r)
+        print('Debug picture saved in debug/')
+    else:
+        ap.print_help()
