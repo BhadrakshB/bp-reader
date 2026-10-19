@@ -1,0 +1,98 @@
+# main.py
+import cv2
+from detector import FreeBPDetector
+from geometry import calculate_median_slope, match_labels_to_numbers
+
+
+def run_pipeline(image_path, debug_output=True):
+  image = cv2.imread(image_path)
+  if image is None:
+    raise FileNotFoundError(
+        f'Could not load image at {image_path}. Check the file path!'
+    )
+
+  # Initialize the 100% free PaddleOCR + OpenCV detector
+  detector = FreeBPDetector()
+
+  # Step 1: Detect labels, numbers, and raw OCR boxes in one go
+  labels, grouped_numbers, raw_ocr_boxes = detector.detect_all(image_path)
+
+  # Step 2: Calculate rotation slope (m) from the text boxes
+  slope = calculate_median_slope(raw_ocr_boxes)
+
+  print(f'[INFO] Detected Labels: {list(labels.keys())}')
+  print(
+      f'[INFO] Estimated Device Tilt Slope (m): {slope:.4f}'
+      f' (~{slope * 57.29:.1f} degrees)'
+  )
+  print(f'[INFO] Numbers Found: {[n["value"] for n in grouped_numbers]}')
+
+  # Step 3: Match labels to numbers using y = mx + c line projection
+  mapped_metrics = match_labels_to_numbers(labels, grouped_numbers, slope=slope)
+
+  # Step 4: Fallback if glare hid a label, but 3 numbers are stacked vertically
+  if len(mapped_metrics) < 3 and len(grouped_numbers) == 3:
+    print(
+        '[WARN] Missing label(s). Applying vertical stacking fallback for'
+        ' remaining fields...'
+    )
+    sorted_nums = sorted(grouped_numbers, key=lambda n: n['box'][1])
+    for field, num_obj in zip(['SYS', 'DIA', 'PUL'], sorted_nums):
+      if field not in mapped_metrics:
+        mapped_metrics[field] = {
+            'value': num_obj['value'],
+            'num_box': num_obj['box'],
+            'label_box': None,
+            'line_params': None,
+        }
+
+  # Step 5: Draw visual debugging overlay
+  if debug_output:
+    h, w, _ = image.shape
+
+    # First, draw all raw detected numbers in thin Grey boxes so you can see what OCR picked up
+    for num in grouped_numbers:
+      bx1, by1, bx2, by2 = num['box']
+      cv2.rectangle(image, (bx1, by1), (bx2, by2), (180, 180, 180), 1)
+
+    # Next, draw the matched labels, rays, and final numbers
+    for field, data in mapped_metrics.items():
+      nx1, ny1, nx2, ny2 = data['num_box']
+      # Draw matched number box (Green)
+      cv2.rectangle(image, (nx1, ny1), (nx2, ny2), (0, 255, 0), 2)
+      cv2.putText(
+          image,
+          f"{field}: {data['value']}",
+          (nx1, max(ny1 - 10, 20)),
+          cv2.FONT_HERSHEY_SIMPLEX,
+          0.8,
+          (0, 255, 0),
+          2,
+      )
+
+      if data['label_box'] and data['line_params']:
+        lx1, ly1, lx2, ly2 = data['label_box']
+        A, B, C = data['line_params']
+        # Draw label box (Blue)
+        cv2.rectangle(image, (lx1, ly1), (lx2, ly2), (255, 100, 0), 2)
+
+        # Draw the projected y = mx + c line across the screen (Yellow)
+        x_start, x_end = lx1, w - 10
+        y_start = int(A * x_start + C)
+        y_end = int(A * x_end + C)
+        cv2.line(image, (x_start, y_start), (x_end, y_end), (0, 255, 255), 2)
+
+    cv2.imwrite('debug_result.jpg', image)
+    print('[INFO] Saved visual debug overlay to debug_result.jpg')
+
+  # Clean dictionary output
+  final_output = {
+      field: data['value'] for field, data in mapped_metrics.items()
+  }
+  return final_output
+
+
+if __name__ == '__main__':
+  readings = run_pipeline('images/bp-monitor-1.jpg')
+  print('\n--- FINAL BP READINGS ---')
+  print(readings)
