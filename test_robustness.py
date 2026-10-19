@@ -75,6 +75,12 @@ def test_glare_fraction():
     assert abs(ss.glare_fraction(img) - 0.01) < 1e-6
 
 
+def test_dark_mask_fully_saturated_does_not_crash():
+    img = np.full((60, 80), 255, np.uint8)
+    m = ss.dark_mask(img)
+    assert m.shape == img.shape and m.sum() == 0
+
+
 # --------------------------------------------------------------- deskew
 def test_deskew_recovers_known_angle():
     img = draw_number('138', slant=0.0)

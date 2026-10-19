@@ -86,6 +86,8 @@ def dark_mask(gray, frac=0.35):
         ref = d[~glare] if glare.any() else d.ravel()
     else:
         ref = d.ravel()
+    if ref.size == 0:               # the whole crop is saturated
+        ref = d.ravel()
     thr = max(0.03, frac * float(np.percentile(ref, 99.5)))
     m = (d > thr).astype(np.uint8) * 255
     return (cv2.medianBlur(m, 5) > 0).astype(np.uint8)
@@ -102,6 +104,8 @@ def _dark_mask_blackhat(gray, frac=0.35):
     bh = bh.astype(np.float32)
     bh[glare] = 0.0
     ref = bh[~glare] if glare.any() else bh.ravel()
+    if ref.size == 0:               # the whole crop is saturated
+        ref = bh.ravel()
     thr = max(8.0, frac * float(np.percentile(ref, 99.5)))
     m = (bh > thr).astype(np.uint8) * 255
     return (cv2.medianBlur(m, 5) > 0).astype(np.uint8)
