@@ -43,6 +43,17 @@ def _w(b):
     return b[2] - b[0]
 
 
+def _dims(c):
+    """(height, width) of a candidate; uses the rotated 4-point polygon when
+    available so tilted rows don't inflate their axis-aligned box."""
+    p = c.get('poly')
+    if p and len(p) == 4:
+        h = (math.dist(p[0], p[3]) + math.dist(p[1], p[2])) / 2
+        w = (math.dist(p[0], p[1]) + math.dist(p[3], p[2])) / 2
+        return h, w
+    return _h(c['box']), _w(c['box'])
+
+
 def _to_tilted(cx, cy, c, s):
     """Rotate a point into the device's own frame.
     u = along the text direction, v = 'down' on the device."""
@@ -54,10 +65,10 @@ def filter_reading_candidates(cands, max_keep=8):
     the screen; bezel scales, dates and memory numbers are smaller."""
     if not cands:
         return []
-    heights = sorted((_h(c['box']) for c in cands), reverse=True)
+    heights = sorted((_dims(c)[0] for c in cands), reverse=True)
     ref = heights[min(2, len(heights) - 1)]  # 3rd tallest ignores one giant outlier
-    kept = [c for c in cands if _h(c['box']) >= 0.5 * ref]
-    kept.sort(key=lambda c: _h(c['box']) * (0.5 + c['conf']), reverse=True)
+    kept = [c for c in cands if _dims(c)[0] >= 0.5 * ref]
+    kept.sort(key=lambda c: _dims(c)[0] * (0.5 + c['conf']), reverse=True)
     return kept[:max_keep]
 
 
@@ -97,14 +108,14 @@ def _score_triple(trip, axis, order, c, s, img_h):
         return None
 
     # The three numbers must sit on clearly separate rows (or columns).
-    extents = [(_h(n['box']) if axis == 'v' else _w(n['box'])) for n in ordered]
+    extents = [(_dims(n)[0] if axis == 'v' else _dims(n)[1]) for n in ordered]
     mean_ext = float(np.mean(extents))
     gaps = [opos[i + 1][key] - opos[i][key] for i in range(2)]
     if min(gaps) < 0.6 * mean_ext:
         return None
 
-    heights = [_h(n['box']) for n in ordered]
-    widths = [_w(n['box']) for n in ordered]
+    heights = [_dims(n)[0] for n in ordered]
+    widths = [_dims(n)[1] for n in ordered]
     conf_term = float(np.mean([0.5 * n['conf'] + 0.5 * n['agreement'] for n in ordered]))
     size_term = min(1.0, float(np.mean(heights)) / (0.1 * img_h))
     sim_term = min(heights) / max(heights)
@@ -149,8 +160,12 @@ def assign_readings(cands, labels, slope, img_h):
             break
     if any(n['agreement'] < 0.5 for n in best.values()):
         reasons.append('readers disagreed on a number')
+    if any(n['agreement'] < 0.6 for n in best.values()):
+        reasons.append('readings differ between photometric variants')
     if any(n['conf'] < 0.5 for n in best.values()):
         reasons.append('low digit confidence')
+    if any(n.get('glare_frac', 0.0) > 0.03 for n in best.values()):
+        reasons.append('glare on display')
     if conflict:
         reasons.append('printed label order disagrees with layout')
     pp = best['SYS']['value'] - best['DIA']['value']

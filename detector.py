@@ -11,6 +11,7 @@ import os
 import re
 
 import cv2
+import numpy as np
 
 os.environ['PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT'] = '0'
 try:
@@ -19,6 +20,11 @@ except ImportError:  # still works, just without labels / cross-check
     PaddleOCR = None
 
 import seven_segment
+
+CFG = {
+    'use_alternatives': True,  # expose per-row second-best readings as candidates
+    'use_dedup': True,         # merge duplicate candidates (same value, same place)
+}
 
 # Patterns run on LETTERS ONLY, so "P/min" becomes "PMIN".
 LABEL_PATTERNS = {
@@ -33,6 +39,7 @@ NUMBER_TOKEN = re.compile(r'^[0-9OILBSZ|!]{2,3}$')
 class BPDetector:
     def __init__(self):
         self.ocr = None
+        self.last_slope = None   # fallback device tilt from the LCD reader
         if PaddleOCR is None:
             print('[WARN] PaddleOCR not installed: no labels, no cross-check.')
             return
@@ -95,6 +102,20 @@ class BPDetector:
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         return [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
 
+    @staticmethod
+    def _dedup(cands):
+        """Merge candidates with the same value at the same place (e.g. the LCD
+        reader and the PaddleOCR safety net both found the 78)."""
+        kept = []
+        for c in sorted(cands, key=lambda c: -(c['conf'] + c['agreement'])):
+            for k in kept:
+                if k['value'] == c['value'] and BPDetector._overlap(k['box'], c['box']) > 0.3:
+                    k['agreement'] = max(k['agreement'], c['agreement'])
+                    break
+            else:
+                kept.append(c)
+        return kept
+
     # ----------------------------------------------------------------- main
     def detect_all(self, image):
         """`image` is a BGR array. Returns (labels, candidates, polygons).
@@ -113,13 +134,17 @@ class BPDetector:
                 paddle_cands.append({'value': value, 'box': box, 'conf': score})
 
         # 2) The real reader: seven-segment digits
-        rows, _ = seven_segment.read_lcd(image)
+        rows, _ = seven_segment.read_lcd(image, label_boxes=list(labels.values()))
         cands = []
+        n_alts = 0
         for r in rows:
             if not seven_segment._plausible(r):
                 continue
             cand = {'value': int(r['text']), 'box': r['box'],
                     'conf': r['conf'], 'agreement': r['agreement']}
+            if 'poly' in r:
+                cand['poly'] = r['poly']
+            cand['glare_frac'] = r.get('glare_frac', 0.0)
             for p in paddle_cands:                      # cross-check with PaddleOCR
                 if self._overlap(cand['box'], p['box']) > 0.5:
                     if p['value'] == cand['value']:
@@ -128,6 +153,33 @@ class BPDetector:
                         cand['agreement'] = min(cand['agreement'], 0.3)
                     break
             cands.append(cand)
+            # second-best readings of the same row, penalized and capped, so the
+            # geometry hard rules can pick them when the primary read is wrong
+            if CFG['use_alternatives']:
+                for alt in r.get('alternatives', [])[:2]:
+                    if n_alts >= 4 or not alt.isdigit():
+                        continue
+                    value = int(alt)
+                    if 30 <= value <= 260:
+                        cands.append({'value': value, 'box': r['box'],
+                                      'conf': r['conf'] * 0.7,
+                                      'agreement': r['agreement'] * 0.5,
+                                      'alternative': True})
+                        n_alts += 1
+
+        if CFG['use_dedup']:
+            cands = self._dedup(cands)
+
+        # Fallback device tilt: median top-edge slope of the LCD rows, for when
+        # PaddleOCR produced no polygons.
+        slopes = []
+        for r in rows:
+            p = r.get('poly')
+            if p and seven_segment._plausible(r):
+                dx = p[1][0] - p[0][0]
+                if abs(dx) > 5:
+                    slopes.append((p[1][1] - p[0][1]) / dx)
+        self.last_slope = float(np.median(slopes)) if slopes else None
 
         # 3) Safety net: if the LCD reader found fewer than 3 numbers, add PaddleOCR's
         if len(cands) < 3:
